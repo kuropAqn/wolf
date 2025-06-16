@@ -1,51 +1,99 @@
-import sqlite3
-import datetime
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
+from discord.utils import get
+import asyncio
+from datetime import datetime
+import os
+import json
 
-bot = commands.Bot(command_prefix="!")
+intents = discord.Intents.default()
+intents.message_content = True
+intents.guilds = True
+intents.members = True
+intents.voice_states = True
 
-def get_db_connection():
-    return sqlite3.connect('bot.db')
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+# --- データベース（仮） ---
+USERS = {}  # user_id: {"xp": int, "level": int, "titles": [], "spas": int, "active_vc": timestamp}
+LEVEL_XP = {i: 100 for i in range(1, 11)}
+for lv in range(11, 81):
+    LEVEL_XP[lv] = round(40 * (1.045 ** (lv - 10)))
+for lv in range(81, 101):
+    LEVEL_XP[lv] = round(668 * (1.08 ** (lv - 80)))
+
+# --- イベントハンドラ ---
+@bot.event
+async def on_ready():
+    print(f"Logged in as {bot.user}")
+    vc_tracker.start()
 
 @bot.event
 async def on_voice_state_update(member, before, after):
-    user_id = member.id
-    now = datetime.datetime.now().timestamp()
-    conn = get_db_connection()
-    c = conn.cursor()
+    uid = str(member.id)
+    now = datetime.utcnow()
+    if before.channel is None and after.channel is not None:
+        USERS.setdefault(uid, {"xp": 0, "level": 1, "titles": [], "spas": 0})
+        USERS[uid]["active_vc"] = now.timestamp()
+    elif before.channel is not None and after.channel is None:
+        if uid in USERS and USERS[uid].get("active_vc"):
+            duration = now.timestamp() - USERS[uid]["active_vc"]
+            if duration >= 60:
+                minutes = int(duration // 60)
+                await add_xp(member, minutes)
+            USERS[uid]["active_vc"] = None
 
-    # VC入室
-    if not before.channel and after.channel:
-        c.execute('REPLACE INTO vc_entries (user_id, entry_time) VALUES (?, ?)', (user_id, now))
-        conn.commit()
-    # VC退出
-    elif before.channel and not after.channel:
-        c.execute('SELECT entry_time FROM vc_entries WHERE user_id = ?', (user_id,))
-        row = c.fetchone()
-        if row:
-            entry_time = row[0]
-            duration = int(now - entry_time)
-            exp_gain = duration // 60  # 1分ごとに1exp
-            if exp_gain > 0:
-                # ユーザーがいなければ作成
-                c.execute('INSERT OR IGNORE INTO users (user_id, exp) VALUES (?, 0)', (user_id,))
-                c.execute('UPDATE users SET exp = exp + ? WHERE user_id = ?', (exp_gain, user_id))
-                await member.send(f"VC滞在{duration}秒で{exp_gain}EXPを獲得しました！")
-            c.execute('DELETE FROM vc_entries WHERE user_id = ?', (user_id,))
-            conn.commit()
-    conn.close()
+# --- XP加算とレベルアップ処理 ---
+async def add_xp(member, minutes):
+    uid = str(member.id)
+    USERS[uid]["xp"] += minutes
+    await check_level_up(member)
 
-# 経験値確認コマンド
+async def check_level_up(member):
+    uid = str(member.id)
+    user = USERS[uid]
+    while user["level"] in LEVEL_XP and user["xp"] >= LEVEL_XP[user["level"]]:
+        user["xp"] -= LEVEL_XP[user["level"]]
+        user["level"] += 1
+        user["spas"] += 10
+        await member.send(f"🎉 レベル{user['level']}にアップ！SPAS$を10獲得しました。")
+        if user["level"] in [10, 15, 20]:  # 称号取得通知（仮）
+            await member.send("新しい称号が取得可能です！ !titles で確認して選択してね。")
+
+# --- VCトラッキング確認（定期チェック） ---
+@tasks.loop(minutes=1)
+async def vc_tracker():
+    now = datetime.utcnow()
+    for uid, data in USERS.items():
+        if data.get("active_vc"):
+            duration = now.timestamp() - data["active_vc"]
+            if duration >= 60:
+                member = await bot.fetch_user(int(uid))
+                minutes = int(duration // 60)
+                await add_xp(member, minutes)
+                USERS[uid]["active_vc"] = now.timestamp()
+
+# --- コマンド：称号一覧表示（仮） ---
 @bot.command()
-async def exp(ctx):
-    user_id = ctx.author.id
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute('SELECT exp FROM users WHERE user_id = ?', (user_id,))
-    row = c.fetchone()
-    exp = row[0] if row else 0
-    await ctx.send(f"{ctx.author.display_name}のEXPは{exp}だ！")
-    conn.close()
+async def titles(ctx):
+    uid = str(ctx.author.id)
+    titles = USERS.get(uid, {}).get("titles", [])
+    if not titles:
+        await ctx.send("現在称号を保有していません。")
+    else:
+        await ctx.send(f"保有称号: {', '.join(titles)}")
 
-bot.run('YOUR_TOKEN')
+# --- コマンド：現在XPとレベル表示 ---
+@bot.command()
+async def status(ctx):
+    uid = str(ctx.author.id)
+    data = USERS.get(uid)
+    if not data:
+        await ctx.send("データが登録されていません。VC参加後に自動で記録されます。")
+    else:
+        await ctx.send(f"レベル: {data['level']} | XP: {data['xp']} | SPAS$: {data['spas']}")
+
+# --- 起動 ---
+TOKEN = os.getenv("DISCORD_BOT_TOKEN")
+bot.run(TOKEN)
+
